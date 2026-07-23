@@ -801,6 +801,16 @@ fn find_via_login_shell(command: &str) -> Option<PathBuf> {
     (path.is_absolute() && is_executable_file(&path)).then_some(path)
 }
 
+/// Resolve a command using the user's login shell rather than the app's PATH.
+///
+/// GUI apps on macOS inherit a minimal PATH that commonly resolves Apple's
+/// `/usr/bin/git` even when a newer Homebrew Git is the user's shell default.
+/// Callers with a command-specific minimum-version requirement can use this as
+/// a fallback after rejecting the ambient-PATH candidate.
+pub(crate) fn resolve_command_via_login_shell(command: &str) -> Option<PathBuf> {
+    find_via_login_shell(command)
+}
+
 /// Three-state backing store for the login-shell PATH cache.
 #[derive(Clone)]
 enum LoginShellPath {

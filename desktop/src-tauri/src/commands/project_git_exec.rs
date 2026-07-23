@@ -4,7 +4,10 @@
 //! the identity nsec is handed to `git-credential-nostr` via environment
 //! variables so nothing key-related ever touches disk or global git config.
 
-use crate::{app_state::AppState, managed_agents::resolve_command};
+use crate::{
+    app_state::AppState,
+    managed_agents::{resolve_command, resolve_command_via_login_shell},
+};
 use nostr::{Keys, ToBech32};
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -16,6 +19,7 @@ use url::Url;
 /// `spawn_blocking` threads indefinitely.
 const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOTE_GIT_TIMEOUT: Duration = Duration::from_secs(300);
+const MIN_AUTH_GIT_VERSION: (u64, u64) = (2, 46);
 
 fn git_subcommand<'a>(args: &'a [&str]) -> Option<&'a str> {
     let mut index = 0;
@@ -71,6 +75,11 @@ pub(crate) fn run_git(
         command.current_dir(cwd);
     }
     let needs_credentials = git_needs_credentials(args);
+    if needs_credentials && auth.credential_helper.is_none() && !auth.allow_file_transport {
+        return Err(
+            "git-credential-nostr was not found; reinstall or update Buzz Desktop".to_string(),
+        );
+    }
     let timeout = if needs_credentials {
         REMOTE_GIT_TIMEOUT
     } else {
@@ -219,8 +228,65 @@ pub(crate) fn build_git_clone_auth_config(
     build_git_auth_config(state)
 }
 
+fn parse_git_version(output: &str) -> Option<(u64, u64)> {
+    let version = output
+        .split_whitespace()
+        .find(|part| part.as_bytes().first().is_some_and(u8::is_ascii_digit))?;
+    let mut components = version.split('.');
+    Some((
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+    ))
+}
+
+fn git_version(path: &std::path::Path) -> Result<(u64, u64), String> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("could not run {} --version: {error}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!("{} --version failed", path.display()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_git_version(&stdout).ok_or_else(|| format!("could not parse Git version from {stdout:?}"))
+}
+
+fn resolve_auth_git() -> Result<std::path::PathBuf, String> {
+    let ambient = resolve_command("git");
+    let login_shell = resolve_command_via_login_shell("git");
+    let mut candidates = Vec::new();
+    if let Some(path) = ambient {
+        candidates.push(path);
+    }
+    if let Some(path) = login_shell {
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    }
+    if candidates.is_empty() {
+        return Err("git was not found on PATH or in the login shell".to_string());
+    }
+
+    let mut found = Vec::new();
+    for path in candidates {
+        match git_version(&path) {
+            Ok(version) if version >= MIN_AUTH_GIT_VERSION => return Ok(path),
+            Ok((major, minor)) => found.push(format!("{} ({major}.{minor})", path.display())),
+            Err(error) => found.push(error),
+        }
+    }
+
+    Err(format!(
+        "Buzz Git authentication requires Git {}.{} or newer; found {}. \
+Install a current Git (for example `brew install git`) and restart Buzz Desktop",
+        MIN_AUTH_GIT_VERSION.0,
+        MIN_AUTH_GIT_VERSION.1,
+        found.join(", ")
+    ))
+}
+
 pub(crate) fn build_git_auth_config_for_keys(keys: &Keys) -> Result<GitAuthConfig, String> {
-    let git_path = resolve_command("git").ok_or_else(|| "git was not found on PATH".to_string())?;
+    let git_path = resolve_auth_git()?;
     let credential_helper = resolve_command("git-credential-nostr");
     let nsec = keys
         .secret_key()
@@ -394,7 +460,7 @@ fn validate_clone_url_against_relay(clone_url: &str, relay_base: &str) -> Result
 mod tests {
     use super::{
         clean_branch, clean_target_ref, credential_helper_config_value, git_needs_credentials,
-        git_subcommand, validate_clone_url, validate_clone_url_against_relay,
+        git_subcommand, parse_git_version, validate_clone_url, validate_clone_url_against_relay,
         validate_local_clone_url,
     };
 
@@ -406,6 +472,16 @@ mod tests {
             credential_helper_config_value(&path),
             "C:/Users/x/AppData/Local/Buzz/git-credential-nostr.exe",
         );
+    }
+
+    #[test]
+    fn parses_standard_and_apple_git_versions() {
+        assert_eq!(parse_git_version("git version 2.46.0\n"), Some((2, 46)));
+        assert_eq!(
+            parse_git_version("git version 2.39.5 (Apple Git-154)\n"),
+            Some((2, 39))
+        );
+        assert_eq!(parse_git_version("not git"), None);
     }
 
     #[test]
